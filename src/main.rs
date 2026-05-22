@@ -7,7 +7,7 @@ use dicom_core::{DataDictionary, DataElement, Tag, dictionary::DataDictionaryEnt
 use dicom_dictionary_std::tags;
 use dicom_object::{InMemDicomObject, StandardDataDictionary};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use walkdir::{self, WalkDir};
 
 #[derive(Debug, Parser)]
@@ -59,21 +59,29 @@ enum FileType {
     Json,
 }
 
-/*
-- improve on the variants
-- possibly add more variants for specific VRs
-- possibly add variants for specific signed/unsigned integers
-- add variants for decimal and float values
-- for Error(String): see if possible to thing of better Error variant for missing values/tags, failed parsing, default values where needed/possible
-*/
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 enum ValueTypes {
-    Integer(i64),
-    UnInteger(u64),
+    SignedInteger(i32),
+    UnsignedInteger(u32),
     Float(f64),
     Text(String),
-    Error(String), // see if possible to thing of better Error variant for missing values/tags, failed parsing, default values where needed/possible
+    DateTime(String),
+    Error(DicomValueParseError),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum DicomValueParseError {
+    MissingTag,
+    UnknownVR,
+    InvalidSignedInteger,
+    InvalidFloat,
+    InvalidUnsignedInteger,
+    InvalidDate,
+    InvalidTime,
+    InvalidDateTime,
+    InvalidString,
+    InvalidAgeString,
 }
 
 #[derive(Serialize)]
@@ -111,28 +119,7 @@ fn main() {
             continue;
         }
 
-        let mut values: Vec<ValueTypes> = Vec::new();
-
-        for tag in &tags {
-            let element = ds.element(*tag).unwrap();
-
-            let value = match element.vr() {
-                AE | CS | LO | LT | PN | SH | ST | UI => element
-                    .to_str()
-                    .map(|s| ValueTypes::Text(s.to_string()))
-                    .unwrap_or(ValueTypes::Error(format!("invalid value"))),
-                IS | SS => element
-                    .to_int::<i64>()
-                    .map(|s| ValueTypes::Integer(s))
-                    .unwrap_or(ValueTypes::Error(format!("invalid integer value"))),
-
-                AS => parse_age(element),
-
-                _ => ValueTypes::Error(format!("unknown tag VR")),
-            };
-
-            values.push(value);
-        }
+        let values = extract_tags(&tags, &ds);
 
         file_values.push(values);
 
@@ -160,6 +147,56 @@ fn main() {
     }
 }
 
+fn extract_tags(tags: &Vec<Tag>, ds: &InMemDicomObject) -> Vec<ValueTypes> {
+    let mut values: Vec<ValueTypes> = Vec::new();
+
+    for tag in tags {
+        let element = match ds.element(*tag) {
+            Ok(e) => e,
+            Err(_) => {
+                values.push(ValueTypes::Error(DicomValueParseError::MissingTag));
+                continue;
+            }
+        };
+
+        let value = match element.vr() {
+            AE | CS | LO | LT | PN | SH | ST | UI | UR | UT => element.to_str().map_or_else(
+                |_| ValueTypes::Error(DicomValueParseError::InvalidString),
+                |s| ValueTypes::Text(s.to_string()),
+            ),
+            IS | SS | SL => element.to_int::<i32>().map_or_else(
+                |_| ValueTypes::Error(DicomValueParseError::InvalidSignedInteger),
+                ValueTypes::SignedInteger,
+            ),
+            AS => parse_age(element),
+            DS | FL | FD => element.to_float64().map_or_else(
+                |_| ValueTypes::Error(DicomValueParseError::InvalidFloat),
+                ValueTypes::Float,
+            ),
+            US | UL => element.to_int::<u32>().map_or_else(
+                |_| ValueTypes::Error(DicomValueParseError::InvalidUnsignedInteger),
+                ValueTypes::UnsignedInteger,
+            ),
+            DA => element.to_date().map_or_else(
+                |_| ValueTypes::Error(DicomValueParseError::InvalidDate),
+                |s| ValueTypes::DateTime(s.to_string()),
+            ),
+            TM => element.to_time().map_or_else(
+                |_| ValueTypes::Error(DicomValueParseError::InvalidTime),
+                |s| ValueTypes::DateTime(s.to_string()),
+            ),
+            DT => element.to_datetime().map_or_else(
+                |_| ValueTypes::Error(DicomValueParseError::InvalidDateTime),
+                |s| ValueTypes::DateTime(s.to_string()),
+            ),
+            _ => ValueTypes::Error(DicomValueParseError::UnknownVR),
+        };
+
+        values.push(value);
+    }
+    values
+}
+
 fn parse_age(element: &DataElement<InMemDicomObject>) -> ValueTypes {
     let parsed_age = element.to_str().ok().and_then(|s| {
         let trimmed = s.trim();
@@ -168,18 +205,15 @@ fn parse_age(element: &DataElement<InMemDicomObject>) -> ValueTypes {
             return None;
         }
 
-        // split at 4rd character (3nd index)
+        // split at 4th character (3rd index)
         let (num_part, _) = trimmed.split_at(3);
 
-        num_part.parse::<i64>().ok()
+        num_part.parse::<u32>().ok()
     });
 
     match parsed_age {
-        Some(age_int) => ValueTypes::Integer(age_int),
-        None => ValueTypes::Error(format!(
-            "unrecognized or malformed age string: {:?}",
-            element.to_str().unwrap_or_default()
-        )),
+        Some(age_int) => ValueTypes::UnsignedInteger(age_int),
+        None => ValueTypes::Error(DicomValueParseError::InvalidAgeString),
     }
 }
 
@@ -247,10 +281,63 @@ fn get_header(tags: Vec<Tag>) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dicom_core::VR;
+
+    #[test]
+    fn to_csv() {
+        // TODO: add other VR types
+        let ds = InMemDicomObject::from_element_iter([
+            DataElement::new(tags::PATIENT_AGE, VR::AS, "050Y"),
+            DataElement::new(tags::STUDY_INSTANCE_UID, VR::UI, "1.2.3"),
+            DataElement::new(tags::EXPOSURE_TIME, VR::IS, "2147483648"),
+            DataElement::new(tags::STUDY_DATE, VR::DA, "20250101"),
+            DataElement::new(tags::ACQUISITION_DATE_TIME, VR::DT, "20250101090530.05"),
+            DataElement::new(tags::STUDY_TIME, VR::TM, "090530.05"),
+        ]);
+
+        let tags = vec![
+            tags::PATIENT_AGE,
+            tags::PATIENT_NAME,
+            tags::STUDY_INSTANCE_UID,
+            tags::EXPOSURE_TIME,
+            tags::STUDY_DATE,
+            tags::ACQUISITION_DATE_TIME,
+            tags::STUDY_TIME,
+        ];
+
+        let values = extract_tags(&tags, &ds);
+
+        let mut writer = csv::Writer::from_writer(Vec::new());
+        writer.serialize(&values).expect("CSV serialization failed");
+        writer.flush().unwrap();
+
+        let bytes = writer.into_inner().expect("failed to get Vec<u8>");
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(&bytes[..]);
+
+        let mut test_output = reader
+            .deserialize::<Vec<ValueTypes>>()
+            .next()
+            .expect("expected at least one row")
+            .expect("failed to deserialize");
+
+        // FIXME: add proper assert_eq! call!!
+        println!("{values:?}");
+        println!("{test_output:?}");
+    }
+
+    fn to_json() {
+        todo!("implement to_json() test case")
+    }
+}
+
 /* TODO:
 OVERALL:
 - improve and reorder the functions
 - add proper error handling
-- improve if possible getting dicom elements and its error handling!!
 - add test cases for future development!!
 */
