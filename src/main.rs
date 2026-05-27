@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::{collections::HashSet, io, path::PathBuf};
+use std::{collections::HashSet, io, path::Path, path::PathBuf};
 
 use clap::{Parser, ValueEnum};
 use dicom_core::VR::*;
@@ -17,9 +17,9 @@ struct Args {
     #[arg(short, long, value_parser = validate_input_path)]
     input_dir: PathBuf,
 
-    /// Path to output file
-    #[arg(short, long, default_value = "./tags.csv")]
-    output_path: PathBuf,
+    /// Path to output directory, default <INPUT_DIR>/tags.csv
+    #[arg(short, long)]
+    output_dir: Option<PathBuf>,
 
     /// write tags at specified DICOM level
     #[arg(short, long, default_value = "study")]
@@ -93,7 +93,7 @@ struct TagData {
 fn main() {
     let args = Args::parse();
 
-    let files = get_dicom_files(args.input_dir);
+    let files = get_dicom_files(&args.input_dir);
     let tags = concat_tags(args.tag, args.preset);
     let mut uid_set: HashSet<String> = HashSet::new();
     let mut file_values: Vec<Vec<ValueTypes>> = Vec::new();
@@ -131,17 +131,23 @@ fn main() {
         values: file_values,
     };
 
+    let output_dir = args.output_dir.unwrap_or(args.input_dir);
+
     match args.filetype {
         FileType::Csv => {
-            let mut writer = csv::Writer::from_path("tags.csv").unwrap();
+            let output_filepath = output_dir.join("tags.csv");
+            let mut writer = csv::Writer::from_path(&output_filepath).unwrap();
             writer.write_record(tag_data.header).unwrap();
             for vals in tag_data.values {
                 writer.serialize(vals).unwrap();
             }
+            println!("written tags to {output_filepath:?}");
         }
         FileType::Json => {
-            let file = File::create("tags.json").unwrap();
+            let output_filepath = output_dir.join("tags.json");
+            let file = File::create(&output_filepath).unwrap();
             serde_json::to_writer_pretty(file, &tag_data).unwrap();
+            println!("written tags to {output_filepath:?}");
         }
     }
 }
@@ -259,7 +265,7 @@ fn validate_tag(tag_string: &str) -> Result<Tag, String> {
         .ok_or_else(|| "invalid DICOM tag keyword or (group,element)".to_string())
 }
 
-fn get_dicom_files(dir: PathBuf) -> Vec<PathBuf> {
+fn get_dicom_files(dir: &Path) -> Vec<PathBuf> {
     WalkDir::new(dir)
         .into_iter()
         .filter_map(Result::ok)
@@ -318,7 +324,7 @@ mod tests {
             .has_headers(false)
             .from_reader(&bytes[..]);
 
-        let mut test_output = reader
+        let test_output = reader
             .deserialize::<Vec<ValueTypes>>()
             .next()
             .expect("expected at least one row")
