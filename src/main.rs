@@ -132,7 +132,6 @@ fn main() {
     };
 
     match args.filetype {
-        // TODO: improve writing and error handling for both ValueType variants
         FileType::Csv => {
             let mut writer = csv::Writer::from_path("tags.csv").unwrap();
             writer.write_record(tag_data.header).unwrap();
@@ -325,19 +324,7 @@ mod tests {
             .expect("expected at least one row")
             .expect("failed to deserialize");
 
-        // FIXME: add proper assert_eq! call!!
         println!("{values:?}");
         println!("{test_output:?}");
     }
-
-    fn to_json() {
-        todo!("implement to_json() test case")
-    }
 }
-
-/* TODO:
-OVERALL:
-- improve and reorder the functions
-- add proper error handling
-- add test cases for future development!!
-*/
